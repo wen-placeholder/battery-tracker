@@ -2,6 +2,10 @@
 
 A full-stack web application for tracking BMW battery cells through their lifecycle — from intake to testing, storage, and final disposition.
 
+## Demo
+
+▶ [Watch Demo Video](https://youtu.be/ARKZAYKnhDw)
+
 ## Features
 
 - **Dashboard** — real-time overview of cell counts by state with progress bars
@@ -98,6 +102,66 @@ The import endpoint accepts `.csv` files with the following columns:
 | GET | `/api/states` | List all valid states |
 | GET | `/api/dashboard` | Get cell count by state |
 | POST | `/api/import` | Import cells from CSV |
+
+## Questions & Decision Log
+
+### 1. Where to store `current_state` — `cells` table or derived from events?
+
+**Options considered:**
+
+- **Option A (chosen):** Store `current_state` directly on the `cells` table as a redundant column, updated on every state change.
+- **Option B:** Derive the current state by querying the latest record in `cell_events` each time it is needed.
+
+**Decision: Option A.**
+
+The Cell List page displays the current state of every cell in a single table view. With Option B, fetching N cells would trigger N additional queries to `cell_events` to resolve each cell's latest state — a classic N+1 problem. Since this application is read-heavy (the list is the most frequently accessed view), the redundancy in Option A is the right trade-off.
+
+The cost is discipline: every state update must atomically write to both `cells` (UPDATE) and `cell_events` (INSERT) inside a single database transaction. This is enforced in every relevant route handler, ensuring the two tables never fall out of sync.
+
+---
+
+### 2. How to model `event_type` — and how does color-coding map to it?
+
+**Options considered:**
+
+- **Option A (chosen):** Use `ENUM('state_change', 'correction', 'note')` for `event_type`, and determine color-coding by inspecting `to_state` for pass/fail outcomes.
+- **Option B:** Add `'passed'` and `'failed'` as explicit `event_type` values to directly match the assignment's color-coding language.
+
+**Decision: Option A.**
+
+The assignment states *"color-coded by event type (pass = green, fail = red, correction = orange)"*, but "pass" and "fail" describe the **outcome** of a state change, not a separate category of event. A transition to `Passed` is still a `state_change` — the same mechanism as any other transition. Introducing `'passed'` and `'failed'` as event types would create overlap with the `to_state` field and blur what `event_type` is meant to represent.
+
+Color logic therefore uses both fields: `event_type` determines whether something is a `correction` (orange) or a `note` (purple), while `to_state` determines whether a state change should render green (`Passed`) or red (`Failed`). This keeps the event model semantically clean.
+
+The three `event_type` values reflect three distinct real-world actions:
+- `state_change` — lifecycle progression (the primary operation)
+- `correction` — an operator correcting a previous entry error
+- `note` — an observation logged without changing state (e.g. "minor surface oxidation noted, monitoring")
+
+---
+
+### 3. Should state transitions be unrestricted, strictly ordered, or partially constrained?
+
+**Options considered:**
+
+- **Option A:** Allow any transition between any two states (fully unrestricted).
+- **Option B:** Enforce strict forward-only progression through the lifecycle.
+- **Option C (chosen):** Partial constraints — block logically impossible transitions, allow everything else.
+
+**Decision: Option C.**
+
+A strict forward-only rule (Option B) is too rigid for a real lab environment. Cells may need to return to `Storage` from `Under Test` if a test run is aborted, or be moved from `Failed` back to `Under Test` for a re-test. The `correction` event type exists precisely to support these operational realities.
+
+However, fully unrestricted transitions (Option A) allow nonsensical operations — most critically, reactivating a disposed cell (`Disposed → Received`), which would corrupt the integrity of the audit trail.
+
+**Chosen constraints:**
+- `Disposed` is a **terminal state**: no further transitions are permitted once a cell is disposed.
+- `Passed` and `Failed` **cannot revert to `Received` or `Incoming QC`**: once through testing, a cell should not re-enter the intake process as if newly arrived.
+- All other transitions remain permitted, preserving the flexibility needed for real lab workflows.
+
+This is enforced at two levels: the backend rejects invalid transitions with HTTP 422 and a descriptive error message, and the frontend proactively removes forbidden options from the state dropdown — so users see only valid choices and never encounter a confusing rejection after submitting.
+
+---
 
 ## Project Structure
 
